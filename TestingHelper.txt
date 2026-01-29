@@ -1,0 +1,172 @@
+What to set for each sector (filters only)
+
+Equity: positionAccount must be a level‑5 book and be in supported-books-for-x-regional-flow; lastMkt ∈ {SBIJ, CHIJ, XJAS, XTKS, XTK1}; deskID ∈ {APAC-PT-RISK-JP, APAC-QET}; securityIDSource=ESMP with a live ESMP alt‑id for a SECURITY_LISTING; counterparty will be forced to SDS apac-qet-or-pt-risk-jp-default-counter-party-id (40108174).
+Option: positionAccount in allow‑list or resolves as settlement account; securityIDSource=ESMP with ESMP alt‑id for DERIVATIVE_LISTING; desk/lastMkt not used; counterparty is overridden to 41644155.
+Future: same as Option.
+Mocha: only book level‑5 check and instrument/counterparty resolution; trading‑desk handler bug will filter equity until you patch it.
+POG proto builders (swap values per sector)
+
+// Common bones
+PBTradeMessage.TradeMessage.Builder pog = PBTradeMessage.TradeMessage.newBuilder()
+    .setExecID("EX1")
+    .setOrderID("ORD1")
+    .setTransactTime(System.currentTimeMillis())
+    .setTradeDate(System.currentTimeMillis())
+    .setSettlDate(System.currentTimeMillis())      // used only for equity
+    .setSide(CommonEnums.Side.Side_BUY)
+    .setLastQty(100)
+    .setLastPx(10.5)
+    .setCurrency("USD")
+    .setSettlCurrency("USD")
+    .setTradeExecutionSystem("STOMPTrading");      // ok for all flows
+
+// Equity message (must match allow‑list + desk/market)
+PBTradeMessage.TradeMessage pogEquity =
+    pog.clone()
+       .setPositionAccount("<BOOK_CODE_L5_ALLOWLIST>") // e.g. from SQL #1
+       .setSecurityIDSource(CommonEnums.SecurityIDSource.SecurityIDSource_ESMP)
+       .setSecurityID("<ESMP_SEC_LISTING>")            // from SQL #2a
+       .setSymbol("<RIC_OR_SYMBOL>")                   // optional; compassSymbol override
+       .setLastMkt("XTKS")
+       .setDeskID("APAC-PT-RISK-JP")
+       .setCustomerAccount("IGNORED")                  // will be overridden to 40108174
+       .build();
+
+// Option message
+PBTradeMessage.TradeMessage pogOption =
+    pog.clone()
+       .setPositionAccount("<BOOK_OR_SETTL_ACCT>")     // allow‑list or settlement account
+       .setSecurityIDSource(CommonEnums.SecurityIDSource.SecurityIDSource_ESMP)
+       .setSecurityID("<ESMP_DERIV_LISTING>")          // from SQL #2b
+       .setLastMkt("")                                 // not used
+       .setDeskID("ANY")                               // not used
+       .setCustomerAccount("IGNORED")                  // overridden to 41644155
+       .build();
+
+// Future message: same as Option, just change ESMP to a future contract alt‑id.
+Mocha proto builders
+
+MochaMessagesDict.ATLASBookingEventEntity.Builder mocha = MochaMessagesDict.ATLASBookingEventEntity.newBuilder()
+    .setGatewayID("EX3")
+    .setAggregationGroupID("ORD3")
+    .setTransactTime(System.currentTimeMillis())
+    .setTradeDate(System.currentTimeMillis())
+    .setSettlDate(System.currentTimeMillis())
+    .setSide(MochaCommonDict.Side.Side_Buy)
+    .setLastQty(150)
+    .setLastPx(12.5)
+    .setCurrency("USD")
+    .setSettlCurrency("USD")
+    .setExecSrc("STOMPTrading");        // any string
+
+// Equity
+MochaMessagesDict.ATLASBookingEventEntity mochaEquity =
+    mocha.clone()
+         .setPositionAccount("<BOOK_CODE_L5_ALLOWLIST>")
+         .setSecurityIDSource(MochaCommonDict.SecurityIDSource.SecurityIDSource_ESMP)
+         .setSecurityID("<ESMP_SEC_LISTING>")
+         .setCounterPartyID("40108174")  // use SDS that exists; replace after SQL #3
+         .build();
+
+// Option/Future
+MochaMessagesDict.ATLASBookingEventEntity mochaOption =
+    mocha.clone()
+         .setPositionAccount("<BOOK_OR_SETTL_ACCT>")
+         .setSecurityIDSource(MochaCommonDict.SecurityIDSource.SecurityIDSource_ESMP)
+         .setSecurityID("<ESMP_DERIV_LISTING>")
+         .setCounterPartyID("41644155")  // or a valid SDS from SQL #3
+         .build();
+Oracle queries to harvest passing values
+
+Level‑5 books that are in the active allow‑list (use these for positionAccount)
+-- Book codes that will satisfy both the cache and the allow‑list gate
+WITH allowlist AS (
+  SELECT LOWER(code) AS code FROM (
+    SELECT 'L.XBL.10216' code FROM dual UNION ALL
+    SELECT 'L.XBL.17156' FROM dual UNION ALL
+    SELECT '19441' FROM dual UNION ALL
+    SELECT 'L.XBL.10215' FROM dual UNION ALL
+    SELECT 'L.XBL.10228' FROM dual UNION ALL
+    SELECT 'L.XBL.10246' FROM dual UNION ALL
+    SELECT 'L.XBL.14145' FROM dual UNION ALL
+    SELECT 'L.XBL.9875'  FROM dual UNION ALL
+    SELECT '19156' FROM dual UNION ALL
+    SELECT '21990' FROM dual UNION ALL
+    SELECT 'L.XBL.10252' FROM dual UNION ALL
+    SELECT 'L.XBL.30083' FROM dual UNION ALL
+    SELECT 'L.XBL.30082' FROM dual
+  )
+)
+SELECT b.id, b.code, bai.alternate_id AS settlement_account
+FROM atlas_owner.book b
+LEFT JOIN atlas_owner.book_alternate_ids bai
+  ON bai.parent_id = b.id AND bai.parent_version = b.version AND bai.schema_id = 5
+WHERE b.record_status = 1
+  AND b.book_level = 5
+  AND LOWER(b.code) IN (SELECT code FROM allowlist)
+FETCH FIRST 20 ROWS ONLY;
+2a) Equity instruments (SECURITY_LISTING, ESMP alt‑id)
+
+SELECT COALESCE(u.SECURITY_ID, u.DERIVATIVE_ID) AS instrument_id,
+       uai.alternate_id AS esmp,
+       u.exchange_id    AS market_id
+FROM atlas_owner.underlying u
+JOIN atlas_owner.UND_ADJUSTED_UND_ALTERNATE_IDS uai
+  ON uai.parent_id = u.id AND uai.parent_version = u.version
+JOIN atlas_owner.ALTERNATE_UNDERLYING_ID_SCHEMA aus
+  ON uai.schema_id = aus.id AND aus.code = 'ESMP' AND aus.record_status = 1
+WHERE u.record_status = 1
+  AND u.underlying_type = 'SECURITY_LISTING'
+  AND u.active = 'Y'
+FETCH FIRST 20 ROWS ONLY;
+2b) Option/Future instruments (DERIVATIVE_LISTING, ESMP alt‑id)
+
+SELECT COALESCE(u.DERIVATIVE_ID, u.SECURITY_ID) AS instrument_id,
+       uai.alternate_id AS esmp,
+       u.exchange_id    AS market_id
+FROM atlas_owner.underlying u
+JOIN atlas_owner.UND_ADJUSTED_UND_ALTERNATE_IDS uai
+  ON uai.parent_id = u.id AND uai.parent_version = u.version
+JOIN atlas_owner.ALTERNATE_UNDERLYING_ID_SCHEMA aus
+  ON uai.schema_id = aus.id AND aus.code = 'ESMP' AND aus.record_status = 1
+WHERE u.record_status = 1
+  AND u.underlying_type = 'DERIVATIVE_LISTING'
+  AND u.active = 'Y'
+FETCH FIRST 20 ROWS ONLY;
+Counterparty SDS/FISS mappings (use SDS for customerAccount / counterPartyID)
+-- Quick check that the configured defaults exist
+SELECT p.sds_id, pai.alternate_id AS fiss_id
+FROM atlas_owner.party p
+LEFT JOIN atlas_owner.party_alternate_ids pai
+  ON pai.parent_id = p.id AND pai.parent_version = p.version AND pai.schema_id = 1
+WHERE p.record_status = 1
+  AND p.sds_id IN (40108174, 41644155);
+
+-- General sample set
+SELECT p.sds_id, pai.alternate_id AS fiss_id
+FROM atlas_owner.party p
+LEFT JOIN atlas_owner.party_alternate_ids pai
+  ON pai.parent_id = p.id AND pai.parent_version = p.version AND pai.schema_id = 1
+WHERE p.record_status = 1
+FETCH FIRST 20 ROWS ONLY;
+(Optional) Settlement accounts longer than 8 chars for trim-path tests
+SELECT b.code, bai.alternate_id AS settlement_account
+FROM atlas_owner.book b
+JOIN atlas_owner.book_alternate_ids bai
+  ON bai.parent_id = b.id AND bai.parent_version = b.version AND bai.schema_id = 5
+WHERE b.record_status = 1
+  AND b.book_level = 5
+  AND LENGTH(bai.alternate_id) > 8
+FETCH FIRST 20 ROWS ONLY;
+How to use the query outputs
+
+BOOK_CODE_L5_ALLOWLIST → positionAccount in all messages.
+settlement_account (schema_id=5) → positionAccount when you want to exercise the settlement-account path; in POG equity/option trimming, also try the first 8 chars.
+esmp from 2a → securityID for equity; from 2b → securityID for option/future. Keep securityIDSource=ESMP.
+instrument_id/market_id are not set on the proto; they are used internally by the instrument cache—ensure the ESMP you pick is present so resolution succeeds.
+sds_id from 3 → customerAccount (POG equity) or counterPartyID (Mocha). For POG non‑equity the value is overridden to 41644155; for POG equity with the required desks it is overridden to 40108174, so verify those rows exist (first query).
+Run order for your tests
+
+Set flow.common.properties.market-sector-description per sector (EQUITY, OPTION, FUTURE) before each run; keep flow.common.properties.downstream-atlas-enabled as in application.yml.
+Use the POG messages when instance.upstreamType=POG (or POG_AMER), Mocha messages when instance.upstreamType=MOCHA.
+Send a message built with values returned by the SQL above; it should pass the cache filters and flow through to publishing/ack.
